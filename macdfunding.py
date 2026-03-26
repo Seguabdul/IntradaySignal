@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 24 19:28:55 2026
+
+@author: sakpb
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Mar 12 17:22:16 2026
+
+@author: sakpb
+"""
+
+"""
+MT5 MACD Trading Bot - Pepperstone Demo Account
+================================================
+Strategy:
+  - Timeframe  : 15 minutes
+  - Signal     : MACD crossover (MACD line crosses above/below Signal line)
+  - Risk:Reward: 1:3  (Stop-Loss = 1 unit, Take-Profit = 3 units)
+  - Data source: yfinance (for symbol mapping / reference prices)
+  - Execution  : MetaTrader 5 Python API
+
+Requirements:
+  pip install MetaTrader5 yfinance pandas numpy
+
+Setup:
+  1. Install MetaTrader 5 terminal from Pepperstone:
+     https://pepperstone.com/en/trading-platforms/metatrader-5/
+  2. Log into your Pepperstone DEMO account in the terminal.
+  3. Run this script — MT5 must be open and logged in.
+"""
+
+import MetaTrader5 as mt5
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+
+# ─────────────────────────────────────────────
+#  CONFIG  — edit these values
+# ─────────────────────────────────────────────
+MT5_ACCOUNT   = 11880838          # Your Pepperstone demo account number
+MT5_PASSWORD  = "o>QhGd]C1"     # Your demo account password
+MT5_SERVER    = "FundingPips2-SIM" # Server name shown in MT5 terminal
+
+SYMBOL        = "EURUSD"          # Forex pair to trade (must exist in MT5)
+TIMEFRAME     = mt5.TIMEFRAME_M15  # 15-minute candles
+LOT_SIZE      = 0.01              # Micro lot — small for demo safety
+
+# MACD Settings
+MACD_FAST     = 12
+MACD_SLOW     = 26
+MACD_SIGNAL   = 9
+
+# Risk:Reward  1 : 3
+RISK_PIPS     = 20                # Stop-Loss distance in pips
+REWARD_PIPS   = RISK_PIPS * 3    # Take-Profit = 3x the risk (60 pips)
+
+MAGIC_NUMBER  = 20240001          # Unique ID for this bot's orders
+SLEEP_SECONDS = 60                # Check interval (seconds)
+# ─────────────────────────────────────────────
+
+
+def connect_mt5():
+    """Initialize and login to MT5."""
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
+
+    authorized = mt5.login(MT5_ACCOUNT, password=MT5_PASSWORD, server=MT5_SERVER)
+    if not authorized:
+        mt5.shutdown()
+        raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
+
+    info = mt5.account_info()
+    print(f"✅ Connected to MT5 | Account: {info.login} | Balance: {info.balance} {info.currency}")
+    print(f"   Server : {info.server}")
+    print(f"   Leverage: 1:{info.leverage}\n")
+
+
+def get_candles(symbol: str, timeframe, count: int = 200) -> pd.DataFrame:
+    """Fetch OHLCV candles from MT5."""
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        raise ValueError(f"No data returned for {symbol}. Is the symbol available in Market Watch?")
+
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.set_index("time", inplace=True)
+    return df
+
+
+def compute_macd(df: pd.DataFrame, fast: int, slow: int, signal: int):
+    """Compute MACD, Signal line, and Histogram."""
+    close = df["close"]
+    ema_fast   = close.ewm(span=fast,   adjust=False).mean()
+    ema_slow   = close.ewm(span=slow,   adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def detect_signal(macd_line: pd.Series, signal_line: pd.Series) -> str:
+    """
+    Returns:
+      'BUY'  — MACD crossed above Signal on the last closed candle
+      'SELL' — MACD crossed below Signal on the last closed candle
+      'NONE' — no crossover
+    """
+    # Use the last two *closed* candles (index -3 and -2; -1 is the live candle)
+    prev_diff = macd_line.iloc[-3] - signal_line.iloc[-3]
+    curr_diff = macd_line.iloc[-2] - signal_line.iloc[-2]
+
+    if prev_diff < 0 and curr_diff > 0:
+        return "BUY"
+    elif prev_diff > 0 and curr_diff < 0:
+        return "SELL"
+    return "NONE"
+
+
+def pips_to_price(symbol: str, pips: float) -> float:
+    """Convert pips to price distance for the given symbol."""
+    sym_info = mt5.symbol_info(symbol)
+    if sym_info is None:
+        raise ValueError(f"Symbol {symbol} not found in MT5.")
+    # For most FX pairs 1 pip = 0.0001; for JPY pairs 1 pip = 0.01
+    pip_size = sym_info.point * 10
+    return round(pips * pip_size, sym_info.digits)
+
+
+def has_open_position(symbol: str) -> bool:
+    """Check if we already have an open position for this symbol."""
+    positions = mt5.positions_get(symbol=symbol)
+    return positions is not None and len(positions) > 0
+
+
+def place_order(symbol: str, direction: str, lot: float, sl_pips: float, tp_pips: float):
+    """Send a market order with SL and TP."""
+    sym_info = mt5.symbol_info_tick(symbol)
+    if sym_info is None:
+        print(f"⚠️  Cannot get tick for {symbol}")
+        return
+
+    sl_dist = pips_to_price(symbol, sl_pips)
+    tp_dist = pips_to_price(symbol, tp_pips)
+
+    if direction == "BUY":
+        order_type = mt5.ORDER_TYPE_BUY
+        price = sym_info.ask
+        sl    = round(price - sl_dist, mt5.symbol_info(symbol).digits)
+        tp    = round(price + tp_dist, mt5.symbol_info(symbol).digits)
+    else:  # SELL
+        order_type = mt5.ORDER_TYPE_SELL
+        price = sym_info.bid
+        sl    = round(price + sl_dist, mt5.symbol_info(symbol).digits)
+        tp    = round(price - tp_dist, mt5.symbol_info(symbol).digits)
+
+    request = {
+        "action"    : mt5.TRADE_ACTION_DEAL,
+        "symbol"    : symbol,
+        "volume"    : lot,
+        "type"      : order_type,
+        "price"     : price,
+        "sl"        : sl,
+        "tp"        : tp,
+        "magic"     : MAGIC_NUMBER,
+        "comment"   : "MACD_Bot_1:3",
+        "type_time" : mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"  ✅ {direction} order placed | Price: {price} | SL: {sl} | TP: {tp} | Ticket: {result.order}")
+    else:
+        print(f"  ❌ Order FAILED | Retcode: {result.retcode} | Comment: {result.comment}")
+
+
+def fetch_yfinance_price(symbol: str) -> float | None:
+    """
+    Optional: fetch reference price from yfinance for cross-verification.
+    MT5 symbol 'EURUSD' maps to yfinance ticker 'EURUSD=X'.
+    """
+    yf_ticker = symbol + "=X" if "USD" in symbol else symbol
+    try:
+        data = yf.download(yf_ticker, period="1d", interval="15m", progress=False)
+        if not data.empty:
+            return float(data["Close"].iloc[-1])
+    except Exception as e:
+        print(f"  ⚠️  yfinance fetch error: {e}")
+    return None
+
+
+def run_bot():
+    """Main loop."""
+    connect_mt5()
+
+    print(f"🤖 Bot started | Symbol: {SYMBOL} | TF: 15min | RR: 1:{int(REWARD_PIPS/RISK_PIPS)}")
+    print(f"   SL: {RISK_PIPS} pips | TP: {REWARD_PIPS} pips | Lot: {LOT_SIZE}\n")
+
+    while True:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] Scanning {SYMBOL}...")
+
+        try:
+            # 1. Fetch candles from MT5
+            df = get_candles(SYMBOL, TIMEFRAME, count=100)
+
+            # 2. Compute MACD
+            macd_line, signal_line, histogram = compute_macd(
+                df, MACD_FAST, MACD_SLOW, MACD_SIGNAL
+            )
+
+            # 3. Cross-verify price with yfinance (informational)
+            yf_price = fetch_yfinance_price(SYMBOL)
+            mt5_price = df["close"].iloc[-1]
+            if yf_price:
+                print(f"  MT5 price: {mt5_price:.5f} | yFinance price: {yf_price:.5f}")
+
+            # 4. Print MACD values
+            m_val = macd_line.iloc[-2]
+            s_val = signal_line.iloc[-2]
+            h_val = histogram.iloc[-2]
+            print(f"  MACD: {m_val:.6f} | Signal: {s_val:.6f} | Histogram: {h_val:.6f}")
+
+            # 5. Detect crossover signal
+            signal = detect_signal(macd_line, signal_line)
+
+            if signal != "NONE":
+                print(f"  🚩 MACD SIGNAL: {signal}")
+                if has_open_position(SYMBOL):
+                    print(f"  ⏸️  Position already open for {SYMBOL} — skipping new order.")
+                else:
+                    place_order(SYMBOL, signal, LOT_SIZE, RISK_PIPS, REWARD_PIPS)
+            else:
+                print(f"  — No crossover signal.")
+
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+
+        print()
+        time.sleep(SLEEP_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user.")
+    finally:
+        mt5.shutdown()
+        print("MT5 disconnected.")
